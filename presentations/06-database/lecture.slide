@@ -1,0 +1,431 @@
+Работа с базами данных
+Лекция 6
+
+* План
+
+- database/sql: стандарт, драйверы, подключение
+- Query / Exec / Scan, транзакции
+- context в БД: таймауты и отмена
+- Пул соединений, NULL
+- Надстройки: sqlx, sqlc, pgx; ORM — обзор
+- Тестируемый репозиторий
+
+* database/sql — это НЕ драйвер
+
+- Единый интерфейс поверх любой SQL-СУБД
+- Драйвер (pgx, lib/pq, mysql...) реализует database/sql/driver
+- Регистрируется через init(): импорт ради побочного эффекта
+
+  import (
+      "database/sql"
+      _ "github.com/jackc/pgx/v5/stdlib" // драйвер "pgx"
+  )
+
+- Код приложения не знает про драйвер — кроме строки DSN
+
+В C++ каждый клиент БД — свой API. Здесь — один стандарт.
+
+* Драйверы Postgres
+
+- `lib/pq` — классика, сейчас в maintenance-режиме
+- `pgx/v5` — современный, рекомендуемый:
+  - через database/sql (stdlib) — остаёмся в стандарте
+  - или нативный API — максимум возможностей Postgres
+
+Выбор по умолчанию: pgx через stdlib.
+Нативный — когда нужны pgtype, COPY, batch, LISTEN/NOTIFY.
+
+* Подключение
+
+.code connect/connect.go
+
+- `sql.Open` НЕ соединяется — только валидирует DSN
+- `PingContext` — первая реальная проверка
+- `*sql.DB` — пул соединений, горутинобезопасен: одна на приложение
+
+* Когда пул не нужен: одно соединение
+
+  conn, err := db.Conn(ctx) // закреплённое соединение из пула
+  if err != nil {
+      return err
+  }
+  defer conn.Close() // не закрывает, а возвращает в пул
+
+  // сессия: temp tables, advisory locks, LISTEN/NOTIFY
+  conn.ExecContext(ctx, `SELECT pg_advisory_lock(42)`)
+
+- CLI-утилитам и скриптам пул не нужен — достаточно одного соединения
+- `db.Conn(ctx)` закрепляет соединение: сессия живёт до `Close()`
+- Ещё проще для серийных запросов: `db.SetMaxOpenConns(1)`
+
+: Зачем закреплять одно соединение: сессия PG живёт на соединении — temp tables, advisory locks, LISTEN/NOTIFY видны только на нём же. Нативный pgx вместо pgxpool: pgx.Connect(ctx, dsn) — один коннект без пула.
+
+* Одна строка: QueryRow
+
+.code queryrow/queryrow.go
+
+- `QueryRowContext` + `Scan` — выборка одной строки
+- `sql.ErrNoRows` — sentinel: различаем через `errors.Is` (лекция 2)
+- Сканить можно только в совместимые с колонками типы
+
+* Query: rows — курсор над соединением
+
+  rows, err := db.QueryContext(ctx, `SELECT id, name FROM users`)
+  if err != nil {
+      return err
+  }
+  defer rows.Close() // ОБЯЗАТЕЛЬНО: курсор держит соединение из пула
+
+- Пока идёт итерация — соединение занято
+- Не закрыл — соединение утекло: под нагрузкой пул иссякнет за секунды
+- Вложенный Query в цикле по rows — второе соединение; масштабируется плохо
+
+* Scan в цикле: rows.Err()
+
+  for rows.Next() {
+      var id int
+      var name string
+      if err := rows.Scan(&id, &name); err != nil {
+          return err
+      }
+      fmt.Println(id, name)
+  }
+  return rows.Err() // ошибка итерации видна только здесь
+
+- `Next()` возвращает false и на конце данных, и на ошибке сети
+- Без `rows.Err()` половина списка неотличима от целого
+- В цикле — только `Scan`: накопи данные, потом работай
+
+* Запись: Exec и RowsAffected
+
+  res, err := db.ExecContext(ctx,
+      `UPDATE users SET name = $1 WHERE id = $2`, name, id)
+  if err != nil {
+      return err
+  }
+  n, _ := res.RowsAffected() // сколько строк реально изменено
+
+- `ExecContext` — для INSERT/UPDATE/DELETE, без результата-строк
+- 0 изменённых строк = оптимистичная проверка: «уже сменил кто-то другой»
+- `LastInsertId` в Postgres не работает
+
+* RETURNING: вернуть сгенерированное
+
+  var id int
+  err := db.QueryRowContext(ctx,
+      `INSERT INTO users (name) VALUES ($1) RETURNING id`, name).Scan(&id)
+
+- Одна поездка вместо INSERT + SELECT
+- `RETURNING` может вернуть любые колонки и выражения — фишка PG
+
+* Параметры: только плейсхолдеры
+
+  // ПРАВИЛЬНО: значение — параметр
+  db.Exec(`INSERT INTO users (name) VALUES ($1)`, name)
+
+  // НЕВЕРНО: конкатенация — SQL-инъекция
+  db.Exec("INSERT INTO users (name) VALUES ('" + name + "')")
+
+- Postgres: `$1, $2, ...` (в MySQL — `?`)
+- Драйвер сам экранирует и типизирует значения
+
+* Транзакции
+
+  tx, err := db.BeginTx(ctx, nil)
+  if err != nil {
+      return err
+  }
+  defer tx.Rollback() // идиома: после Commit это no-op
+
+  if _, err := tx.ExecContext(ctx,
+      `UPDATE accounts SET balance = balance - $1 WHERE id = $2`,
+      amount, from); err != nil {
+      return err
+  }
+  // ... то же через tx для зачисления на счёт to ...
+  return tx.Commit()
+
+- Внутри транзакции — только методы `tx`, НЕ `db`
+- `defer tx.Rollback()` — страховка: при забытой ошибке не повиснет с локами
+- `BeginTx` принимает ctx — вся транзакция отменяется таймаутом
+- Изоляция: `sql.TxOptions{Isolation: sql.LevelSerializable}`
+
+* Уровни изоляции — зачем
+
+- Read Committed (дефолт PG): чужие коммиты видны между запросами
+- Repeatable Read: снимок данных на всю транзакцию
+- Serializable: как будто выполнялись последовательно
+- Конфликт → ошибка сериализации → ретраим транзакцию
+
+Гонка данных — не только в памяти: у БД те же проблемы (лекция 3).
+
+* Эволюция: БД без context
+
+  db.Query(...)   // Go 1.0 — отменить нельзя
+  db.Exec(...)
+
+- БД зависла или запрос тяжёлый — горутина висит
+- Соединение не вернулось в пул; несколько таких — пул исчерпан
+- Приложение стоит, хотя CPU свободен
+
+* Go 1.8: *Context-методы
+
+  db.QueryContext(ctx, ...)
+  db.ExecContext(ctx, ...)
+  db.QueryRowContext(ctx, ...)
+  db.PrepareContext(ctx, ...)
+  db.BeginTx(ctx, opts)
+
+- Таймаут и отмена едут до драйвера
+- pgx снимет запрос и на стороне сервера БД
+- Правило: в новом коде — только *Context-методы
+
+* Идиома: таймаут на запрос
+
+  ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+  defer cancel()
+
+  err := db.QueryRowContext(ctx, q, id).Scan(&u)
+
+- Дедлайн из HTTP-хендлера едет вниз по стеку (лекция 3)
+- При таймауте соединение вернётся в пул, горутина не зависнет
+
+* Пул соединений
+
+.code poolcfg/poolcfg.go
+
+- `SetMaxOpenConns` — потолок; без него под нагрузкой лавина
+- `SetConnMaxLifetime` — защита от протухших соединений
+  (рестарт БД, таймауты балансировщика)
+- Настраивают и приложение, и сервер БД — вместе
+
+* Грабли: дедлок на пуле
+
+  for rows.Next() {               // держим соединение №1
+      var u User
+      db.QueryRowContext(ctx,     // нужно соединение №2...
+          `SELECT * FROM orders WHERE user_id = $1`, u.ID)
+  }
+  // MaxOpenConns = 1: QueryRow ждёт соединение,
+  // а оно вернётся только после rows.Close() — тупик
+
+- Пул конечен: горутина ждёт соединение, пока сама держит другое
+- Фикс 1: собрать данные и `rows.Close()` — новые запросы после цикла
+- Фикс 2: поднять `MaxOpenConns` или отдельный `*sql.DB`
+- `-race` не поймает: это логическая блокировка, а не гонка данных
+
+* Подготовленные выражения
+
+  stmt, err := db.PrepareContext(ctx, `SELECT ... WHERE id = $1`)
+  defer stmt.Close()
+  err = stmt.QueryRowContext(ctx, id).Scan(&name)
+
+- Сервер кэширует план запроса — выгодно для частых однотипных
+- Внутри: по одному *Stmt на каждое соединение пула
+- Для остального — обычные вызовы с параметрами
+
+* NULL
+
+.code nulls/nulls.go
+
+- `NULL` ≠ нулевое значение: Scan в string упадёт с ошибкой
+- `sql.NullString` / `NullInt64` / `NullTime`: поле `.Valid` + значение
+- Альтернатива — указатели: `*string`, NULL → nil
+- `pgtype` (pgx): массивы, jsonb, uuid, диапазоны
+
+: Паттерн «NULL → значение по умолчанию»: var nick sql.NullString; если !nick.Valid — вернуть "аноним". Помогает и COALESCE прямо в SQL.
+
+* sqlx: Scan в структуру
+
+  var users []User
+  dbx.SelectContext(ctx, &users, `SELECT ... LIMIT $1`, 10)
+
+  var u User
+  dbx.GetContext(ctx, &u, `SELECT ... WHERE id = $1`, id)
+
+  // именованные аргументы — работают на любом драйвере
+  dbx.NamedExec(`INSERT INTO users (name) VALUES (:name)`,
+      map[string]any{"name": "Аня"})
+
+- Надстройка над database/sql: reflection по тегам `db:"..."`
+- SQL пишем руками, boilerplate Scan исчезает
+- Именованные аргументы `:name` — тоже защита от инъекций
+
+* sqlc: SQL → код
+
+  -- query.sql
+  -- name: GetUser :one
+  SELECT id, name FROM users WHERE id = $1;
+
+        ↓ sqlc generate
+
+  func (q *Queries) GetUser(ctx context.Context,
+      id int32) (User, error)
+
+- Не библиотека, а генератор: типы проверяет компилятор
+- В духе Go: SQL виден явно, runtime-магии нет
+
+* pgx нативный
+
+  pool, err := pgxpool.New(ctx, dsn) // свой пул, без database/sql
+  if err != nil {
+      return err
+  }
+  defer pool.Close()
+
+  rows, err := pool.Query(ctx, `SELECT name FROM users LIMIT $1`, 100)
+
+- `pgxpool` — собственный пул, тоньше настраиваемый
+- Batch-запросы, `COPY`, `LISTEN`/`NOTIFY`
+- `pgtype` — полная палитра типов Postgres
+- Цена: привязка к Postgres — выход из абстракции database/sql
+
+* ORM: gorm и ent
+
+  type User struct {
+      ID   uint
+      Name string `gorm:"not null"`
+  }
+  db.Create(&User{Name: "Аня"})
+  db.First(&u, 1)
+
+- gorm: быстро начать; цена — reflection-магия, N+1, неявные SELECT *
+- ent: schema-first + кодогенерация — типобезопаснее, вход дороже
+- Выбор: контроль SQL — pgx+sqlc; CRUD-прототип — gorm
+
+* Сравнение: что выбрать
+
+  инструмент  суть         плюс                 минус
+  ------------  -------------  ---------------------  ------------------------
+  sqlx        надстройка   Scan в структуры     SQL руками, reflect
+  sqlc        генератор    типобезопасность     динамич. запросы
+  pgx         драйвер      скорость, фичи PG    привязка к Postgres
+  gorm        ORM          быстрый старт        N+1, магия, SELECT *
+  ent         ORM+codegen  типобезопасный граф  высокий порог входа
+
+- По умолчанию — pgx + sqlc: контроль и производительность
+- gorm — когда CRUD-прототип важнее контроля; ent — сложные связи
+
+* Другие хранилища: Redis и ClickHouse
+
+  // Redis (go-redis): свой протокол, НЕ database/sql
+  rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+  rdb.Set(ctx, "user:42", "Аня", time.Minute)
+  val, _ := rdb.Get(ctx, "user:42").Result()
+
+  // ClickHouse: есть database/sql-драйвер
+  db, _ := sql.Open("clickhouse", dsn)
+
+- `database/sql` — только для SQL; у Redis/Mongo свои идиоматичные клиенты
+- Redis — key-value в памяти: те же идеи — клиент, ctx, пул коннектов
+- ClickHouse — колоночная аналитика; MySQL — go-sql-driver/mysql
+
+* Тестируемый репозиторий: интерфейс
+
+  type User struct {
+      ID   int
+      Name string
+  }
+
+  // Интерфейс объявляет потребитель (сервис) — лекция 2
+  type UserRepository interface {
+      GetByID(ctx context.Context, id int) (User, error)
+      Create(ctx context.Context, name string) (int, error)
+  }
+
+- Сервис зависит от интерфейса, а не от `*sql.DB`
+- Сервис тестируем с фейком — БД не нужна вообще
+- SQL живёт в одном месте — реализации репозитория
+
+* Реализация: Postgres
+
+  func (r *Postgres) GetByID(ctx context.Context, id int) (User, error) {
+      var u User
+      err := r.db.QueryRowContext(ctx,
+          `SELECT id, name FROM users WHERE id = $1`, id).Scan(&u.ID, &u.Name)
+      if errors.Is(err, sql.ErrNoRows) {
+          return User{}, fmt.Errorf("user %d: %w", id, ErrNotFound)
+      }
+      return u, err
+  }
+
+- Всё знакомое: `QueryRowContext`, `errors.Is`, оборачивание `%w`
+- «Не найден» превращается в доменную ошибку — сервис решает
+
+* Тест репозитория: sqlmock
+
+  db, mock, _ := sqlmock.New() // подменяет драйвер
+  defer db.Close()
+
+  rows := sqlmock.NewRows([]string{"id", "name"}).AddRow(42, "Аня")
+  mock.ExpectQuery(regexp.QuoteMeta(getUserSQL)).
+      WithArgs(42).
+      WillReturnRows(rows)
+
+  r := New(db)
+  u, err := r.GetByID(context.Background(), 42)
+  if err != nil {
+      t.Fatalf("GetByID: %v", err)
+  }
+
+- `sqlmock.New()` — реальный Postgres не нужен
+- ExpectQuery / WithArgs / WillReturnRows — сценарий запроса
+- Проверяются и текст SQL, и параметры
+
+* sqlmock: сценарий «не найдено»
+
+  mock.ExpectQuery(regexp.QuoteMeta(getUserSQL)).
+      WillReturnError(sql.ErrNoRows)
+
+  _, err := r.GetByID(context.Background(), 1)
+  if !errors.Is(err, ErrNotFound) {
+      t.Errorf("err = %v, want ErrNotFound", err)
+  }
+  mock.ExpectationsWereMet()
+
+- Sentinel `ErrNoRows` превращается в доменный `ErrNotFound`
+- `ExpectationsWereMet` — все ли ожидания выполнены
+- Честное поведение — testcontainers-go (занятие 7)
+
+* Миграции схемы: goose
+
+  -- +goose Up
+  CREATE TABLE IF NOT EXISTS users (
+      id   SERIAL PRIMARY KEY,
+      name TEXT NOT NULL
+  );
+
+  -- +goose Down
+  DROP TABLE users;
+
+  $ goose -dir migrations postgres "$DSN" up
+
+- Схема версионируется в репозитории, как код
+- Нумерованные файлы; в БД — таблица с текущей версией
+- Применённую миграцию не редактируют — добавляют новую
+- Из кода — `goose.Up(db, "migrations")`; ещё есть golang-migrate и atlas
+
+: Атлас — декларативный подход нового поколения: описываешь желаемую схему, он сам считает дифф с текущей БД и линтует опасные изменения. Миграции можно вшить в бинарник через go:embed. Правило деплоя — expand/contract: старый бинарь живёт, пока новый накатил схему, поэтому ломающие изменения разбивают на шаги.
+
+* Практика
+
+- `docker run` postgres:16 → `schema.sql` → репозиторий Create/GetByID
+- `List(ctx, limit)` + таймаут через `WithTimeout`
+- Перевод между счетами в одной транзакции
+- `pg_sleep(10)` + `WithCancel`: соединение вернулось в пул?
+- (опц.) переписать на нативный pgx или sqlc
+
+* Домашнее задание
+
+- Update / Delete + `ErrNoRows` + оборачивание ошибок `%w`
+- Тест репозитория: sqlmock или testcontainers (лекция 4)
+- Пул: SetMaxOpenConns / ConnMaxLifetime + бенчмарк Create
+- (опц.) тот же репозиторий на gorm — сравнить код и запросы
+
+* Материалы
+
+- go.dev/doc/database
+- pkg.go.dev/database/sql, jackc/pgx/v5
+- sqlc.dev, gorm.io/docs, entgo.io/docs
+- go-redis/redis, ClickHouse/clickhouse-go, yandex/hasql
+- «100 Go Mistakes» — раздел про БД

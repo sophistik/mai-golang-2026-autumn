@@ -1,0 +1,249 @@
+Дженерики, JSON и стандартная библиотека
+Лекция 5
+
+* План
+
+- Дженерики: type parameters, constraints, comparable
+- cmp, slices, maps — стандартная библиотека Go 1.21+
+- encoding/json: теги, кастомные маршаллеры, поток
+- io, os, bufio — ввод-вывод без магии
+- time и regexp — обзор
+
+* Проблема: одна функция — много типов
+
+  func MaxInt(a, b int) int          { ... }
+  func MaxFloat(a, b float64) float64 { ... }
+  func MaxString(a, b string) string  { ... }
+
+Копипаста. Вариант через any:
+
+  func MaxAny(a, b any) any {
+      // type assertion, ручные проверки,
+      // ошибка типа — паника в рантайме
+  }
+
+В C++ это шаблоны. В Go — дженерики (Go 1.18).
+
+: Дилемма дженериков (Rob Pike): быстрые программисты, компилятор, программа — выбери два. C++ платит компилятором (мономорфизация), Java — программой (erasure+boxing), Go 1.0 — программистом (копипаста). Черновик 2018 с «contracts» отвергли как «язык в языке»; в 1.18 constraints — обычные интерфейсы. Скромнее шаблонов: нет специализации, метапрограммирования, перегрузки операторов. Полная история — в тексте лекции.
+
+: any под капотом (лекция 2): eface = (дескриптор типа, данные). Упаковка не-словесного значения — аллокация в кучу. v.(int) — сравнение дескрипторов в рантайме; промах — паника interface conversion. MaxAny("go", 7) компилируется молча. У any ноль операций — до дженериков сравнение передавали функцией (sort.Slice). Дженерики: проверка при компиляции, без boxing'а, без assertions.
+
+* Сортировка до дженериков: Len, Less, Swap
+
+.play sortold/main.go
+
+- Три метода на каждый ключ сортировки — boilerplate в каждом проекте
+
+: Облегчённый вариант — sort.Slice: без типа-обёртки, но func(i, j int) над any, типы компилятор не проверяет. В C++ std::sort с лямбдой всегда был типизированным — в Go до 1.18 так не умели. Boilerplate Len/Less/Swap — один из явных аргументов proposal #43685 за дженерики. К этой боли вернёмся на слайде 11: появится slices.SortFunc.
+
+* Type parameters
+
+.play maxdemo/main.go
+
+- `[T cmp.Ordered]` — параметры типа перед аргументами
+- Тип выводится сам: `Max(3, 7)` — это `Max[int]`
+- Ошибка типов ловится компилятором, а не паникой
+
+* Обобщённые типы: Stack
+
+.code stackdemo/stack.go
+
+- Параметр типа — на объявлении структуры: `Stack[T any]`
+- В методах пишем через `T`, новых параметров метод не вводит
+- Нулевое значение — `var zero T` (не nil!)
+
+: Run здесь не нужен — код читается как текст. Live-демо в терминале: s := &Stack[string]{}; Push("go"), Push("c++"), Pop → "c++", true. n := &Stack[int]{}; Push(9), Pop → 9, true. Pop на пустом → zero T и false (для int это 0): вот зачем var zero T — вернуть nil нельзя, компилятор не даст.
+
+* Constraints: что можно делать с T
+
+.code constraints/constraints.go
+
+- Constraint — это интерфейс: набор разрешённых типов
+- Union через `|`: `int | int64 | float64`
+- `~` — любой тип с тем же underlying: `~float64` пропустит Celsius
+- `comparable` — все типы, где работает `==`
+
+* comparable и any
+
+  func Index[T comparable](s []T, x T) int // поиск через ==
+  func First[T any](s []T) (T, bool)       // any не сравнить
+
+- `any` не даёт ни одной операции — только хранить и передавать
+- Для `==` нужен `comparable`, для `+` — свой union, для `<` — `cmp.Ordered`
+- Constraint задаёт ровно те операции, которые использует функция
+
+* Ограничение: методы не параметризуют
+
+  type Stack[T any] struct{ items []T }
+
+  // ОШИБКА: метод не может вводить свой параметр типа
+  func (s *Stack[T]) Map[U any](f func(T) U) []U
+
+Обход — свободная функция:
+
+  func Map[T, U any](s *Stack[T], f func(T) U) []U
+
+* cmp, slices, maps — Go 1.21+
+
+.code cmpdemo/packages.go
+
+- `cmp.Compare` / `cmp.Less` — вместо ручных `if`
+- `slices`: Sort, Contains, Max, Index, Clone, Equal...
+- `maps`: Keys, Values, Clone, Copy, Equal...
+- `slices.Sorted(maps.Keys(m))` — детерминированный обход мапы
+
+* Сортировка теперь: slices.SortFunc
+
+.play sortnew/main.go
+
+- Компаратор возвращает int: -1/0/+1 через `cmp.Compare`
+- Для `Ordered` компаратор не нужен вовсе: `slices.Sort` (слайд 10)
+
+: Помните ByAge и три метода (слайд 4)? Вот та же сортировка одним вызовом. SortFunc — типизированный аналог std::sort с лямбдой: типы и сигнатуру проверяет компилятор. Компаратор возвращает int, как memcmp в C, а не bool: ошибку в сигнатуре Less компилятор не заметил бы. В новом коде: slices.Sort / SortFunc / SortStableFunc; пакет sort — легаси.
+
+* JSON: до дженериков и после
+
+  func DecodeUser(data []byte) (User, error) {
+      var u User
+      err := json.Unmarshal(data, &u)
+      return u, err
+  }
+  // + DecodeOrder, DecodeConfig — по обёртке на каждый тип
+
+  func Decode[T any](data []byte) (T, error) {
+      var v T
+      err := json.Unmarshal(data, &v)
+      return v, err
+  }
+  u, err := Decode[User](data) // тип проверяет компилятор
+
+Было — копипаста обёрток. Стало — одна функция на все типы.
+
+- Сам json не ускорился: reflect и рантайм-проверки остались
+- Теги, лишние поля, UnmarshalTypeError — всё по-прежнему рантайм
+
+: Памятник до-дженериковой эпохе: json.Marshal(v any) разбирает структуру reflect'ом в рантайме. Дженерики почистили код потребителей, но не сам пакет: reflect внутри остался. Пути убрать рантайм — кодогенерация (easyjson) и готовящийся encoding/json/v2. Дженерики — не серебряная пуля.
+
+* encoding/json: теги полей
+
+.code jsondemo/tags.go
+
+- Тег — аннотация: имя поля в JSON + опции через запятую
+- `omitempty` — пустое значение не сериализуем
+- `-` — поле вообще не попадает в JSON
+- Без тега — имя поля как объявлено (с заглавной)
+
+* Приватные поля в json не попадают
+
+.code jsondemo/unexported.go
+
+- reflect видит только экспортированные поля: lowercase — молча мимо
+- `Unmarshal` их тоже не заполнит — ключ молча игнорируется
+- Это фича: служебные поля делай приватными — не утекут в API
+
+: Правило видимости в действии: чужой пакет не может читать приватные поля, значит сериализатор физически не может их вывести. Отладка: поле «пропало из json» — первым делом проверь регистр первой буквы.
+
+* Анмаршализация
+
+  var u User
+  err := json.Unmarshal(b, &u)
+
+- Только указатель: куда складывать результат
+- Незнакомые поля JSON молча игнорируются
+- Чего не хватило — нулевое значение: не ошибка!
+- Ошибка в одном поле — UnmarshalTypeError, остальное распарсится
+
+* omitempty: внимание на нулевые значения
+
+  type Order struct {
+      Paid  bool `json:"paid,omitempty"`  // false пропадёт!
+      Count int  `json:"count,omitempty"` // 0 пропадёт!
+  }
+
+- `omitempty` скрывает нулевые значения, а не «пустые»
+- Ложь на проводе: получатель не отличит false от «нет поля»
+- Нужно различать — указатели или sql.Null*-подобные типы
+
+* Кастомные маршаллеры
+
+.code jsondemo/custom.go
+
+- `MarshalJSON` / `UnmarshalJSON` — методы интерфейсов из пакета
+- Кейсы: время, decimal, enum-строки, legacy-форматы
+- В UnmarshalJSON оборачиваем ошибки через `%w`
+
+: Полный UnmarshalJSON: var s string; json.Unmarshal(b, &s); n, err := strconv.Atoi(strings.TrimSuffix(s, "s")); при ошибке fmt.Errorf("duration %q: %w", s, err); d.Seconds = n. %w — оборачивание через errors.Is (лекция 2); на слайде тело свёрнуто в комментарий, чтобы влезло.
+
+* Поток: Encoder и Decoder
+
+.play streamdemo/main.go
+
+- `Decode` в цикле до `io.EOF` — JSONL (объект на строку) из io.Reader
+- `Encode` пишет в io.Writer и сам добавляет `\n`
+
+* io.Reader и io.Writer
+
+  type Reader interface { Read(p []byte) (n int, err error) }
+  type Writer interface { Write(p []byte) (n int, err error) }
+
+- Два интерфейса держат весь ввод-вывод в Go (лекция 2)
+- Файлы, сокеты, HTTP-тела, буферы — всё реализует их
+- Комбинируются: io.Copy, io.LimitReader, io.MultiWriter
+
+* io.Copy и os
+
+.play iocopy/main.go
+
+- `io.Copy(dst, src)` — копирование без ручных буферов
+- `os.ReadFile` / `os.WriteFile` — мелкие файлы целиком
+- `os.Open` / `os.Create` — потоково, не забыть `defer Close()`
+- `os.Args`, `os.Getenv`, `os.Stdin/Stdout/Stderr`
+
+* bufio: буферизованное чтение
+
+.play scanner/main.go
+
+- `bufio.Scanner` — построчное чтение: `Scan()` + `Text()`
+- Лимит строки — 64 КБ: больше — `sc.Buffer(...)`
+- Ошибка НЕ завершает цикл — проверяется `sc.Err()` после
+- `bufio.Writer` копит байты и пишет пачкой — меньше syscall'ов
+
+* time: эталонный формат
+
+.code timedemo/time.go
+
+- Layout — не шаблон, а эталон: `2006-01-02 15:04:05 MST`
+- Мнемоника: 1 2 3 4 5 6 7 — месяц, день, час, минута, сек, год, зона
+- `time.RFC3339` — готовый layout; json пишет time.Time именно в него
+
+: Четвёртый тезис — проговорить устно: time.Since, t.Sub, time.Sleep, time.NewTimer. Duration — обычный int64 наносекунд; бенчмарки лекции 4 меряют время через time.Since.
+
+* regexp: RE2
+
+.play regexdemo/main.go
+
+- Синтаксис RE2: линейное время, без катастрофического бэктрекинга
+- Цена: нет backreferences и lookahead
+- `MustCompile` — на уровне пакета; компилируем один раз
+- `FindStringSubmatch` → подгруппы в `m[1]`, `m[2]`...
+
+* Практика
+
+- `Map` / `Filter` / `Reduce` на дженериках + таблица тестов (лекция 4)
+- Бенчмарк: `Stack[T]` против `Stack` на `any` — посмотреть на аллокации
+- Конфиг: `os.ReadFile` + `json.Unmarshal` + валидация полей
+- Лог: `bufio.Scanner` + `regexp`, статистика в map
+- JSONL-фильтр: Decoder → Filter → Encoder в выходной файл
+
+* Домашнее задание
+
+- `Contains[T comparable](s []T, x T) bool` + сравнение со `slices.Contains`
+- Мини-конфигуратор: JSON → типизированная структура с валидацией
+- Утилита-фильтр логов/JSONL с отчётом: io + regexp + bufio
+
+* Материалы
+
+- go.dev/blog/intro-to-generics
+- go.dev/blog/json — «JSON and Go»
+- pkg.go.dev/cmp, pkg.go.dev/slices, pkg.go.dev/maps
+- «100 Go Mistakes» — главы про дженерики и JSON

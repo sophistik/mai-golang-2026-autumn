@@ -1,0 +1,293 @@
+Тестирование, бенчмарки и тулинг
+Лекция 4
+
+* План
+
+- Пакет testing: тесты, таблицы, субтесты
+- Бенчмарки: `-bench`, `-benchmem`
+- Покрытие кода
+- Тулинг: gofmt, goimports, go vet, golangci-lint
+- pprof — обзор
+
+Тесты — часть стандартного тулчейна: без сторонних фреймворков.
+
+* Первый тест
+
+  func Div(a, b int) int { return a / b } // mathdemo/math.go
+
+.code mathdemo/math_test.go
+
+- Файл теста — только `*_test.go`: видит `go test`, игнорирует `go build`
+- Имя — `Test` + НЕ-строчная: `TestDiv` ок, `Testdiv` не запустится
+- Сигнатура `(t *testing.T)`, пакет тот же; `go test` находит сам
+- `t.Errorf` — FAIL и продолжить: соберём все падения за прогон
+- `t.Fatalf` — FAIL и немедленный выход из теста: дальше код не живёт
+
+: Разница только в том, что после провала. Errorf: отчёт по всем полям сразу — маска got/want в каждой строке. Fatalf = Logf + FailNow: горутина теста завершается на месте (runtime.Goexit), остальные строки НЕ выполнятся. Правило: дальнейший код зависит от проверки (err не nil, объект может быть nil) — Fatalf; проверяем независимые поля — Errorf.
+
+* Таблица тестов
+
+.code table/sign_test.go
+
+- Слайс анонимных структур: вход + ожидание
+- Новый кейс = новая строка таблицы, без копипасты
+- Имя кейса ушло в сообщение об ошибке
+
+* Субтесты и t.Parallel
+
+  // та же таблица: кейсы получают имена
+  for _, tt := range tests {
+      t.Run(tt.name, func(t *testing.T) {
+          t.Parallel() // параллельно остальным
+          // проверки tt
+      })
+  }
+
+- Вывод: `TestSign/positive` — видно, какой кейс упал
+- `go test -run TestSign/positive` — фильтр
+- `t.Parallel`: осторожно с общими переменными
+
+* t.Helper и t.Cleanup
+
+  func setup(t *testing.T) *Store {
+      t.Helper() // падение сошлётся на строку ТЕСТА, не сюда
+      st := NewStore()
+      t.Cleanup(func() { st.Close() })
+      return st
+  }
+
+- `t.Helper` — для функций-помощников
+- `t.Cleanup` — как defer, но на уровень теста или субтеста
+
+* Skip, Short и флаги testing
+
+  func TestSyncWithDB(t *testing.T) {
+      if testing.Short() {
+          t.Skip("интеграционный: пропущен в -short")
+      }
+      db := connect(t) // тяжёлая часть — после Skip
+  }
+
+- `t.Skip` / `t.Skipf` — «неприменим здесь»: skipped ≠ провал
+- `t.Log` / `t.Logf` — лог теста: виден с `-v` и при падении
+- `t.Fatalf` = Logf + FailNow; FailNow — только из горутины теста
+- Флаги: `-run`, `-v`, `-race`, `-short`, `-count=N`, `-timeout`
+
+: Причина Skip видна в -v. Семантика одна: Errorf = Fail+Log, Fatalf = FailNow+Logf. -timeout (дефолт 10 мин) уронит весь пакет с дампом горутин — висящий тест находится сразу.
+
+* TestMain и фикстуры
+
+  func TestMain(m *testing.M) { // одна на пакет
+      // setup: контейнер, БД, окружение
+      code := m.Run() // все тесты пакета
+      // teardown
+      os.Exit(code)
+  }
+
+- `t.TempDir()` — каталог на тест, удалится сам
+- `t.Setenv(k, v)` — переменная окружения с гарантированным откатом
+- `setup(t)` + `t.Cleanup` — чаще хватает их, TestMain — для тяжёлого
+- Golden files: эталонный файл-ожидание + флаг `-update`
+
+: TestMain — под общий сетап (контейнер один раз на пакет). Интеграционные — под тегом //go:build integration: go test -tags=integration. Утечки горутин — goleak.VerifyNone(t).
+
+* testify: assert и require
+
+  got, err := Parse("42")
+  require.NoError(t, err)  // провал → тест ЗАКОНЧИЛСЯ здесь
+  assert.Equal(t, 42, got) // провал → FAIL, но код идёт дальше
+  assert.Equal(t, "42", got.String())
+
+- assert = t.Errorf: пометить FAIL и продолжить — увидим ВСЕ расхождения
+- require = t.Fatalf: пометить FAIL и немедленно выйти из теста
+- Правило: без этой проверки дальше падать/паниковать → require
+- Набор проверок один: Equal, NoError, Nil, Contains, Len, ErrorIs...
+- Порядок (t, expected, actual); f-варианты: Equalf(t, w, g, "кейс %s", n)
+
+: assert/require — те же Errorf/Fatalf, но с красивыми диффами. И тот и другой останавливает только ТЕКУЩУЮ функцию теста — соседние тесты живут. Gotcha: time.Time сравнивать .Equal-методом или InDelta — DeepEqual видит монотонные часы. Same — идентичность указателей, Equal — значения. suite — не идиома.
+
+* Моки: свои фейки вместо Mockito
+
+  type Store interface { // интерфейс объявляет потребитель
+      Get(key string) (string, bool)
+  }
+
+  // фейк — ручная реализация, живёт в тесте
+  type fakeStore map[string]string
+
+  func (f fakeStore) Get(key string) (string, bool) {
+      v, ok := f[key]
+      return v, ok
+  }
+
+  Greet(fakeStore{"user": "Аня"}, "user") // "Привет, Аня"
+
+- Мок — своя реализация интерфейса (лекция 2), без рефлексии и магии
+- Терминов почти не надо: fake/stub/spy пишутся одинаково просто
+- Интерфейсов много → кодогенерация: mockgen, mockery
+- Тяжёлые зависимости (БД, HTTP) — sqlmock, testcontainers: лекция 6
+
+: Mockito-стайл when/thenReturn в Go почти не встречается: свой маленький тип читается лучше. Правило: интерфейс объявляет потребитель — тогда фейк пишется без изменения продакшн-кода. Runnable-версия: mock/ (go test ./mock/).
+
+* mockgen: моки в табличных тестах
+
+  // party/party.go:
+  //go:generate mockgen -destination=app/mocks/party.go party Greeter,VisitorLister
+
+  $ go generate ./...    // моки появились в app/mocks/
+
+  tests := []struct {
+      name    string
+      prepare func(f *fields) // ожидания этого кейса
+      args    args
+      wantErr bool
+  }{ ... }
+
+  for _, tt := range tests {
+      t.Run(tt.name, func(t *testing.T) {
+          ctrl := gomock.NewController(t) // свой на каждый кейс
+          f := fields{
+              list:  mocks.NewMockVisitorLister(ctrl),
+              greet: mocks.NewMockGreeter(ctrl),
+          }
+          if tt.prepare != nil { tt.prepare(&f) } // EXPECT() тут
+          err := svc.GreetVisitors(tt.args.justNice)
+          if (err != nil) != tt.wantErr { t.Errorf("%v", err) }
+      })
+  }
+
+- `go generate ./...` — моки генерируются в репозиторий
+- EXPECT() нельзя в таблице: нужен живой контроллер — он в t.Run
+- Кейсы идемпотентны; `gomock.InOrder` — проверка порядка вызовов
+
+: Полный пример: mockgen/ — PartyService из статьи Авито (habr.com/ru/companies/avito/articles/658907). Ручной фейк для простых подстановок, mockgen — когда надо проверять взаимодействия. В старом коде defer ctrl.Finish() обязателен; с go.uber.org/mock ставится сам через t.Cleanup.
+
+* Фаззинг: тест на свойствах
+
+  func FuzzReverse(f *testing.F) {
+      f.Add("привет") // seed-корпус
+      f.Fuzz(func(t *testing.T, s string) {
+          if back := Reverse(Reverse(s)); back != s {
+              t.Errorf("свойство сломалось на %q", s)
+          }
+      })
+  }
+
+  // go test                          # seed'ы — как обычный тест
+  // go test -fuzz=FuzzReverse -fuzztime=30s
+
+- Таблица = конкретные кейсы; фаззинг = СВОЙСТВО на тысячах входов
+- Мутирует корпус по покрытию: ищет паники, зависания, нарушения
+- Найденный вход — в testdata/fuzz: регресс-тест навсегда
+- Для всего, что ест внешний ввод: парсеры, кодеки, regexp, json
+
+: Пример в репо: fuzz/ — нашёл за 5 секунд вход "\xa9" (битый UTF-8 ломает двойной реверс: []rune заменяет байты на U+FFFD). Свойство уточнили, вход остался в testdata как регресс-тест. Аргументы Fuzz — только примитивы. По умолчанию фузер крутится до находки, -fuzztime — лимит; в CI — ночные прогоны, не на каждый коммит.
+
+* Бенчмарк
+
+.code bench/sum_test.go
+
+- `go test -bench=. -benchmem`
+- `b.N` платформа подбирает: цикл повторяется, пока замер не устаканится
+- `sink` — иначе компилятор выкинет вызов как неиспользуемый
+
+* Чтение вывода бенчмарка
+
+  BenchmarkSum-8   12345678   98.5 ns/op   48 B/op   1 allocs/op
+
+- `-8` — GOMAXPROCS
+- ns/op — время итерации; B/op и allocs/op — память
+- Часто важнее аллокации, чем наносекунды
+
+* Параллельный бенчмарк
+
+.code bench/par_test.go
+
+- `b.RunParallel` — GOMAXPROCS горутин делят b.N между собой
+- Общий счётчик — только атомарно: иначе меряем не то
+
+* Покрытие
+
+  go test -cover
+  go test -coverprofile=c.out
+  go tool cover -html=c.out
+
+- Показывает, какие строки исполнили тесты
+- 100% покрытия ≠ нет багов: качество тестов важнее процента
+
+* gofmt и goimports
+
+- `gofmt` — формат не настраивается (лекция 1)
+- `goimports` = gofmt + автоуправление импортами
+- Настроить в редакторе: форматирование при сохранении
+
+* go vet
+
+- Статический анализ: printf-форматы, копирование lock, unreachable
+- Внутри `go test` запускается автоматически
+- `go vet ./...` — перед каждым коммитом
+
+* golangci-lint
+
+- Мета-лайнер: staticcheck, errcheck, revive и десятки других одним запуском
+- Конфиг `.golangci.yml`: включённые линтеры, исключения
+- Ставим в CI: пропущенная ошибка не должна доходить до ревью
+
+* Свой линтер: go/analysis
+
+  var noprint = &analysis.Analyzer{
+      Name: "noprint", // станет именем проверки
+      Doc:  "запрещает print/println — используйте fmt/log",
+      Run:  run,
+  }
+
+  func run(pass *analysis.Pass) (interface{}, error) {
+      for _, f := range pass.Files {
+          ast.Inspect(f, func(n ast.Node) bool {
+              call, ok := n.(*ast.CallExpr)
+              if !ok { return true }
+              id, _ := call.Fun.(*ast.Ident)
+              if id != nil && (id.Name == "print" || id.Name == "println") {
+                  pass.Reportf(call.Pos(), "используйте fmt/log")
+              }
+              return true
+          })
+      }
+      return nil, nil
+  }
+
+- Линтер — статанализ по AST и типам: код не запускается, только факты
+- `singlechecker.Main` — готовый CLI; `go vet -vettool=...` — как vet
+- В golangci-lint — плагины; проще — отдельный шаг в CI
+
+: Пример целиком: linter/ — go run ./linter ./linter/demo. На go/analysis написан и сам go vet. Тесты анализаторов — analysistest + testdata (// want "..." в исходнике). Свои правила из практики: «в хендлерах нет прямого db», «только наш логгер».
+
+* pprof — обзор
+
+- `import _ "net/http/pprof"` — профили через HTTP-эндпоинт
+- `go tool pprof`: top, list, web, flame graph
+- Профили: CPU, heap, goroutine, block, mutex
+- Подробно и с руками — занятие 10
+
+* Практика
+
+- Покрыть `Div` и `Sign` из слайдов таблицами тестов
+- Фейк для интерфейса из занятия 2 + таблица тестов с ним
+- Бенчмарк `sumTo`: снять `-benchmem`, объяснить аллокации
+- Прогнать `go vet` и `golangci-lint` на коде занятий 1–2
+- Покрытие `go test -cover` до и после добавления тестов: сравнить
+
+* Домашнее задание
+
+- Таблицы тестов для `chunk` и `wordCount` из занятия 1
+- Бенчмарк: `strings.Builder` против конкатенации в цикле — числа в отчёт
+- Поднять покрытие домашнего калькулятора до 90%+
+- Попробовать mockgen на интерфейсе из ДЗ занятия 2
+- Настроить `.golangci.yml` в своём проекте и починить замечания
+
+* Материалы
+
+- go.dev/doc/tutorial/add-a-test
+- «Table driven tests» — go.dev/wiki
+- «How to write benchmarks in Go» — go.dev/blog
+- golangci-lint.run — документация
